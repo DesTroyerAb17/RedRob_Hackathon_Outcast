@@ -1,49 +1,19 @@
-# ============================================================
-# precompute.py
-# Redrob Hackathon — Intelligent Candidate Discovery & Ranking
-#
-# Reads candidates.jsonl, scores every candidate against the JD
-# using BGE-base-en-v1.5 semantic similarity plus structured
-# signals (career history, behavioral data, fraud detection),
-# and saves precomputed_features.pkl for rank.py to consume.
-#
-# Usage:
-#   python precompute.py
-#
-# Requires: candidates.jsonl in the working directory.
-# Output:   precomputed_features.pkl
-#
-# Runs on GPU if available (faster), falls back to CPU automatically.
-# Not subject to the 5-min ranking-step time limit (see submission_spec
-# Section 10.3) — this script may take longer; only rank.py is timed.
-# ============================================================
 
-import json, pickle, time, os, numpy as np
+
+import json, pickle, os, numpy as np
 from datetime import date, datetime
 
 CANDIDATES_FILE     = "candidates.jsonl"
 OUTPUT_PKL          = "precomputed_features.pkl"
 TODAY               = date(2026, 6, 21)
-BGE_BATCH_SIZE      = 512
-RETRIEVAL_THRESHOLD = 0.52   # norm score threshold for "role has retrieval signal"
-MAX_DESC_WORDS      = 120    # cap on role description length fed to the encoder
+BGE_BATCH_SIZE      = 1024
+RETRIEVAL_THRESHOLD = 0.52
+MAX_DESC_WORDS      = 120
 
-# ─── TIMER UTIL (phase-level only) ───────────────────────────
-PHASE_TIMES = {}
+LOCAL_MODEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                 "models", "bge-base-en-v1.5")
 
-class phase_timer:
-    def __init__(self, name):
-        self.name = name
-    def __enter__(self):
-        self.t0 = time.perf_counter()
-        print(f"[{self.name}] starting ...")
-        return self
-    def __exit__(self, *exc):
-        dt = time.perf_counter() - self.t0
-        PHASE_TIMES[self.name] = dt
-        print(f"[{self.name}] done in {dt:.2f}s")
-
-# ─── ANCHOR SENTENCES ────────────────────────────────────────
+# ─── anchor sentences ─────────────────────────────────────────
 
 LEVEL1_ANCHORS = [
     "Built and deployed a semantic search system serving real users in production",
@@ -159,7 +129,6 @@ NTH_SETS = [
     ("opensource",  NTH_OPENSOURCE,  0.03),
 ]
 
-# ─── COMPANY CLASSIFICATION ───────────────────────────────────
 CONSULTING = {
     "tcs", "infosys", "wipro", "capgemini", "hcl",
     "mindtree", "accenture", "cognizant", "tech mahindra", "mphasis"
@@ -169,10 +138,9 @@ FILLER = {
     "dunder mifflin", "wayne enterprises",
     "acme corp", "globex inc", "stark industries",
 }
-
 CV_TITLES = ["computer vision", "vision engineer", "speech recogn", "robotics"]
 
-# ─── HELPERS ─────────────────────────────────────────────────
+# ─── helpers ────────────────────────────────────────────────
 
 def days_since(date_str):
     try:
@@ -184,10 +152,7 @@ def days_since(date_str):
 def is_consulting_only(career):
     if not career:
         return False
-    return all(
-        any(co in h.get("company", "").lower() for co in CONSULTING)
-        for h in career
-    )
+    return all(any(co in h.get("company", "").lower() for co in CONSULTING) for h in career)
 
 def is_wrong_domain(career_text):
     WRONG = [
@@ -215,10 +180,7 @@ def honeypot_check(candidate):
     tolerance   = max(6, yoe_mo * 0.15)
     penalties   = []
 
-    impossible = sum(
-        1 for s in skills
-        if s.get("duration_months", 0) > yoe_mo * 1.5 + tolerance
-    )
+    impossible = sum(1 for s in skills if s.get("duration_months", 0) > yoe_mo * 1.5 + tolerance)
     if impossible >= 7:   penalties.append(0.25)
     elif impossible >= 5: penalties.append(0.55)
     elif impossible >= 3: penalties.append(0.80)
@@ -243,7 +205,7 @@ def honeypot_check(candidate):
             pass
     overlaps = 0
     for i in range(len(date_ranges)):
-        for j in range(i+1, len(date_ranges)):
+        for j in range(i + 1, len(date_ranges)):
             s1, e1 = date_ranges[i]
             s2, e2 = date_ranges[j]
             if (min(e1, e2) - max(s1, s2)).days > 30:
@@ -253,13 +215,11 @@ def honeypot_check(candidate):
 
     for s in skills:
         name = s.get("name", "")
-        if (name in assessments and s.get("proficiency") == "expert"
-                and assessments[name] < 25):
+        if name in assessments and s.get("proficiency") == "expert" and assessments[name] < 25:
             penalties.append(0.55)
             break
 
-    descs = [h.get("description", "").strip() for h in career
-             if h.get("description", "").strip()]
+    descs = [h.get("description", "").strip() for h in career if h.get("description", "").strip()]
     if len(descs) >= 3:
         unique = len(set(descs))
         if unique == 1:
@@ -277,8 +237,7 @@ def compute_hopping_penalty(career):
     short_hops  = 0
     for i in range(len(recent) - 1):
         dur            = recent[i].get("duration_months", 99)
-        company_change = (recent[i].get("company", "").lower()
-                          != recent[i+1].get("company", "").lower())
+        company_change = recent[i].get("company", "").lower() != recent[i + 1].get("company", "").lower()
         if dur < 18 and company_change:
             short_hops += 1
     if short_hops >= 2: return 0.80
@@ -338,9 +297,8 @@ def compute_product_score(career):
 
 def compute_python_bonus(skills):
     for s in skills:
-        if "python" in s.get("name", "").lower():
-            if s.get("proficiency") in ("intermediate", "advanced", "expert"):
-                return 0.05
+        if "python" in s.get("name", "").lower() and s.get("proficiency") in ("intermediate", "advanced", "expert"):
+            return 0.05
     return 0.0
 
 def compute_behavioral(sigs):
@@ -363,8 +321,7 @@ def compute_behavioral(sigs):
     int_s    = (1.0 if int_rate >= 0.8 else 0.85 if int_rate >= 0.6
                 else 0.70 if int_rate >= 0.4 else 0.50)
 
-    raw = (open_s * 0.25 + act_s * 0.30 + rr_s * 0.20 +
-           rt_s * 0.05 + notice_s * 0.12 + int_s * 0.08)
+    raw = open_s * 0.25 + act_s * 0.30 + rr_s * 0.20 + rt_s * 0.05 + notice_s * 0.12 + int_s * 0.08
 
     completeness = sigs.get("profile_completeness_score", 0)
     if completeness >= 80: raw += 0.02
@@ -390,38 +347,28 @@ def build_role_text(role):
         return f"{title} at {company}: {desc}"
     return f"{title} at {company}"
 
-# ── norm: calibrated from actual BGE-base distribution ───────
 def norm(x, lo=0.55, hi=0.72):
     return float(np.clip((x - lo) / (hi - lo), 0.0, 1.0))
-
-# ─── BGE ─────────────────────────────────────────────────────
 
 def load_model():
     from sentence_transformers import SentenceTransformer
     import torch
-    cuda_ok = torch.cuda.is_available()
-    device  = "cuda" if cuda_ok else "cpu"
-    if not cuda_ok:
-        torch.set_num_threads(os.cpu_count())
-    print(f"device={device}"
-          + (f", torch.get_num_threads()={torch.get_num_threads()}" if not cuda_ok else ""))
-    m = SentenceTransformer("BAAI/bge-base-en-v1.5", device=device)
-    return m
+    os.environ["HF_HUB_OFFLINE"] = "1"
+    os.environ["TRANSFORMERS_OFFLINE"] = "1"
+    torch.set_num_threads(os.cpu_count())
+    return SentenceTransformer(LOCAL_MODEL_PATH, device="cpu")
 
-def encode(model, texts):
+def encode(model, texts, show_progress=False):
     return model.encode(
         texts,
         batch_size=BGE_BATCH_SIZE,
-        show_progress_bar=len(texts) > 500,
+        show_progress_bar=show_progress,
         normalize_embeddings=True,
         convert_to_numpy=True,
     ).astype(np.float32)
 
 def top_k_mean(sims, k=3):
-    top = np.sort(sims)[-k:]
-    return float(top.mean())
-
-# ─── GATE ────────────────────────────────────────────────────
+    return float(np.sort(sims)[-k:].mean())
 
 def passes_gate(c, career_text):
     profile  = c.get("profile", {})
@@ -441,217 +388,173 @@ def passes_gate(c, career_text):
         return False, "wrong_domain"
     return True, "ok"
 
-# ─── MAIN ────────────────────────────────────────────────────
+# ─── main ───────────────────────────────────────────────────
 
 def main():
-    RUN_T0 = time.perf_counter()
+    with open(CANDIDATES_FILE, "r", encoding="utf-8") as f:
+        raw_candidates = [json.loads(line) for line in f if line.strip()]
 
-    with phase_timer("01_read_jsonl"):
-        print(f"Reading {CANDIDATES_FILE} ...")
-        raw_candidates = []
-        with open(CANDIDATES_FILE, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if line:
-                    raw_candidates.append(json.loads(line))
-        print(f"Read {len(raw_candidates):,} candidates")
+    all_role_texts, role_index, career_texts = [], [], []
+    for ci, c in enumerate(raw_candidates):
+        career    = c.get("career_history", [])
+        full_text = " ".join(build_role_text(h) for h in career).lower()
+        career_texts.append(full_text)
+        for ri, h in enumerate(career):
+            all_role_texts.append(build_role_text(h))
+            role_index.append((ci, ri))
 
-    with phase_timer("02_build_role_texts"):
-        print("Building role texts ...")
-        all_role_texts = []
-        role_index     = []
-        career_texts   = []
-        for ci, c in enumerate(raw_candidates):
-            career    = c.get("career_history", [])
-            full_text = " ".join(build_role_text(h) for h in career).lower()
-            career_texts.append(full_text)
-            for ri, h in enumerate(career):
-                all_role_texts.append(build_role_text(h))
-                role_index.append((ci, ri))
-        print(f"  {len(all_role_texts):,} role texts, "
-              f"{len(set(all_role_texts)):,} unique")
+    model = load_model()
 
-    with phase_timer("03_load_model"):
-        model = load_model()
+    unique_texts, inverse = np.unique(np.array(all_role_texts, dtype=object), return_inverse=True)
+    unique_embs = encode(model, list(unique_texts), show_progress=True)
+    role_embs   = unique_embs[inverse]
 
-    with phase_timer("04_encode_role_texts"):
-        unique_texts, inverse = np.unique(
-            np.array(all_role_texts, dtype=object), return_inverse=True
-        )
-        unique_embs = encode(model, list(unique_texts))
-        role_embs   = unique_embs[inverse]
-        print(f"  encoded {len(unique_texts):,} unique texts -> "
-              f"role_embs shape {role_embs.shape}")
+    anc_l1  = encode(model, LEVEL1_ANCHORS)
+    anc_l2a = encode(model, EMBEDDING_ANCHORS)
+    anc_l2b = encode(model, VECTORDB_ANCHORS)
+    anc_l2c = encode(model, EVAL_ANCHORS)
+    anc_nth = [(name, encode(model, sents), bonus) for name, sents, bonus in NTH_SETS]
+    del model
 
-    with phase_timer("05_encode_anchors"):
-        anc_l1  = encode(model, LEVEL1_ANCHORS)
-        anc_l2a = encode(model, EMBEDDING_ANCHORS)
-        anc_l2b = encode(model, VECTORDB_ANCHORS)
-        anc_l2c = encode(model, EVAL_ANCHORS)
-        anc_nth = [(name, encode(model, sents), bonus) for name, sents, bonus in NTH_SETS]
-
-    with phase_timer("06_similarity_matmuls"):
-        sim_l1  = role_embs @ anc_l1.T
-        sim_l2a = role_embs @ anc_l2a.T
-        sim_l2b = role_embs @ anc_l2b.T
-        sim_l2c = role_embs @ anc_l2c.T
-        sim_nth = [(name, role_embs @ enc.T, bonus) for name, enc, bonus in anc_nth]
+    sim_l1  = role_embs @ anc_l1.T
+    sim_l2a = role_embs @ anc_l2a.T
+    sim_l2b = role_embs @ anc_l2b.T
+    sim_l2c = role_embs @ anc_l2c.T
+    sim_nth = [(name, role_embs @ enc.T, bonus) for name, enc, bonus in anc_nth]
 
     cand_role_indices = {}
     for flat_idx, (ci, ri) in enumerate(role_index):
         cand_role_indices.setdefault(ci, []).append(flat_idx)
 
-    del model
+    features = []
+    for ci, c in enumerate(raw_candidates):
+        career_text    = career_texts[ci]
+        passed, reason = passes_gate(c, career_text)
+        if not passed:
+            continue
 
-    with phase_timer("07_feature_loop_TOTAL"):
-        print("Extracting features ...")
-        features    = []
-        gate_counts = {}
+        hp      = honeypot_check(c)
+        profile = c.get("profile", {})
+        skills  = c.get("skills", [])
+        sigs    = c.get("redrob_signals", {})
+        career  = c.get("career_history", [])
+        yoe     = profile.get("years_of_experience", 0)
 
-        for ci, c in enumerate(raw_candidates):
-            career_text   = career_texts[ci]
-            passed, reason = passes_gate(c, career_text)
-            if not passed:
-                gate_counts[reason] = gate_counts.get(reason, 0) + 1
-                continue
+        idxs = cand_role_indices.get(ci, [])
 
-            hp      = honeypot_check(c)
-            profile = c.get("profile", {})
-            skills  = c.get("skills", [])
-            sigs    = c.get("redrob_signals", {})
-            career  = c.get("career_history", [])
-            yoe     = profile.get("years_of_experience", 0)
+        if idxs:
+            rs_l1  = sim_l1[idxs]
+            rs_l2a = sim_l2a[idxs]
+            rs_l2b = sim_l2b[idxs]
+            rs_l2c = sim_l2c[idxs]
 
-            idxs = cand_role_indices.get(ci, [])
+            per_role_l1 = [top_k_mean(rs_l1[ri], k=min(3, rs_l1.shape[1])) for ri in range(len(idxs))]
 
-            if idxs:
-                rs_l1  = sim_l1[idxs]
-                rs_l2a = sim_l2a[idxs]
-                rs_l2b = sim_l2b[idxs]
-                rs_l2c = sim_l2c[idxs]
+            best_l1  = rs_l1.max(axis=0)
+            best_l2a = rs_l2a.max(axis=0)
+            best_l2b = rs_l2b.max(axis=0)
+            best_l2c = rs_l2c.max(axis=0)
 
-                per_role_l1 = [top_k_mean(rs_l1[ri], k=min(3, rs_l1.shape[1]))
-                               for ri in range(len(idxs))]
+            score_l1  = top_k_mean(best_l1,  k=min(3, len(best_l1)))
+            score_l2a = top_k_mean(best_l2a, k=min(3, len(best_l2a)))
+            score_l2b = top_k_mean(best_l2b, k=min(3, len(best_l2b)))
+            score_l2c = top_k_mean(best_l2c, k=min(3, len(best_l2c)))
 
-                best_l1  = rs_l1.max(axis=0)
-                best_l2a = rs_l2a.max(axis=0)
-                best_l2b = rs_l2b.max(axis=0)
-                best_l2c = rs_l2c.max(axis=0)
+            nth_scores = {}
+            nth_bonus  = 0.0
+            for name, sim_mat, bonus in sim_nth:
+                best_nth = sim_mat[idxs].max(axis=0)
+                s        = top_k_mean(best_nth, k=min(2, len(best_nth)))
+                nth_scores[name] = float(s)
+                if s > 0.62:
+                    nth_bonus += bonus
+            nth_bonus = min(nth_bonus, 0.05)
 
-                score_l1  = top_k_mean(best_l1,  k=min(3, len(best_l1)))
-                score_l2a = top_k_mean(best_l2a, k=min(3, len(best_l2a)))
-                score_l2b = top_k_mean(best_l2b, k=min(3, len(best_l2b)))
-                score_l2c = top_k_mean(best_l2c, k=min(3, len(best_l2c)))
+            recency_boost        = norm(per_role_l1[0]) * 0.15 if per_role_l1 else 0.0
+            retrieval_role_count = sum(1 for s in per_role_l1 if norm(s) > RETRIEVAL_THRESHOLD)
+            depth_bonus          = min(retrieval_role_count * 0.04, 0.12)
 
-                nth_scores = {}
-                nth_bonus  = 0.0
-                for name, sim_mat, bonus in sim_nth:
-                    best_nth = sim_mat[idxs].max(axis=0)
-                    s        = top_k_mean(best_nth, k=min(2, len(best_nth)))
-                    nth_scores[name] = float(s)
-                    if s > 0.62:
-                        nth_bonus += bonus
-                nth_bonus = min(nth_bonus, 0.05)
+            n_l1_raw   = norm(score_l1)
+            avg_level2 = (norm(score_l2a) + norm(score_l2b) + norm(score_l2c)) / 3.0
+            framework_penalty = 0.85 if (n_l1_raw > 0.65 and avg_level2 < 0.35) else 1.0
+        else:
+            per_role_l1 = []
+            score_l1 = score_l2a = score_l2b = score_l2c = 0.0
+            nth_scores = {}
+            nth_bonus = recency_boost = depth_bonus = 0.0
+            retrieval_role_count = 0
+            framework_penalty = 1.0
 
-                recency_boost        = norm(per_role_l1[0]) * 0.15 if per_role_l1 else 0.0
-                retrieval_role_count = sum(1 for s in per_role_l1 if norm(s) > RETRIEVAL_THRESHOLD)
-                depth_bonus          = min(retrieval_role_count * 0.04, 0.12)
+        n_l1  = norm(score_l1)
+        n_l2a = norm(score_l2a)
+        n_l2b = norm(score_l2b)
+        n_l2c = norm(score_l2c)
 
-                n_l1_raw   = norm(score_l1)
-                avg_level2 = (norm(score_l2a) + norm(score_l2b) + norm(score_l2c)) / 3.0
-                framework_penalty = 0.85 if (n_l1_raw > 0.65 and avg_level2 < 0.35) else 1.0
-            else:
-                per_role_l1          = []
-                score_l1 = score_l2a = score_l2b = score_l2c = 0.0
-                nth_scores           = {}
-                nth_bonus            = 0.0
-                recency_boost        = 0.0
-                depth_bonus          = 0.0
-                retrieval_role_count = 0
-                framework_penalty    = 1.0
+        level2        = n_l2a * 0.33 + n_l2b * 0.37 + n_l2c * 0.30
+        career_signal = min((0.60 * n_l1 + 0.40 * level2) + recency_boost + depth_bonus, 1.0)
+        career_signal *= framework_penalty
 
-            n_l1  = norm(score_l1)
-            n_l2a = norm(score_l2a)
-            n_l2b = norm(score_l2b)
-            n_l2c = norm(score_l2c)
+        current_title_l = profile.get("current_title", "").lower()
+        if any(ttl in current_title_l for ttl in CV_TITLES):
+            career_signal *= 0.70
 
-            level2        = n_l2a * 0.33 + n_l2b * 0.37 + n_l2c * 0.30
-            career_signal = (0.60 * n_l1 + 0.40 * level2) + recency_boost + depth_bonus
-            career_signal = min(career_signal, 1.0)
-            career_signal *= framework_penalty
+        gh_raw   = sigs.get("github_activity_score", -1)
+        gh_score = 0.0 if gh_raw == -1 else gh_raw / 100.0
 
-            current_title_l = profile.get("current_title", "").lower()
-            if any(ttl in current_title_l for ttl in CV_TITLES):
-                career_signal *= 0.70
+        retrieval_companies = [
+            career[ri].get("company", "")
+            for ri, s in enumerate(per_role_l1)
+            if norm(s) > RETRIEVAL_THRESHOLD and ri < len(career)
+        ]
 
-            gh_raw   = sigs.get("github_activity_score", -1)
-            gh_score = 0.0 if gh_raw == -1 else gh_raw / 100.0
+        features.append({
+            "candidate_id":          c["candidate_id"],
+            "career_signal":         career_signal,
+            "level1_raw":            float(score_l1),
+            "level1_norm":           n_l1,
+            "level2a_norm":          n_l2a,
+            "level2b_norm":          n_l2b,
+            "level2c_norm":          n_l2c,
+            "recency_boost":         recency_boost,
+            "depth_bonus":           depth_bonus,
+            "retrieval_role_count":  retrieval_role_count,
+            "retrieval_companies":   retrieval_companies,
+            "nth_bonus":             nth_bonus,
+            "nth_scores":            nth_scores,
+            "python_bonus":          compute_python_bonus(skills),
+            "product_score":         compute_product_score(career),
+            "yoe_score":             compute_yoe_score(yoe),
+            "location_score":        compute_location_score(profile, sigs),
+            "github_score":          gh_score,
+            "behavioral":            compute_behavioral(sigs),
+            "hopping_penalty":       compute_hopping_penalty(career),
+            "hp_penalty":            hp,
+            "meta": {
+                "title":        profile.get("current_title", ""),
+                "company":      profile.get("current_company", ""),
+                "yoe":          yoe,
+                "location":     profile.get("location", ""),
+                "country":      profile.get("country", "").lower(),
+                "notice":       sigs.get("notice_period_days", 90),
+                "open_to_work": sigs.get("open_to_work_flag", False),
+                "last_active":  days_since(sigs.get("last_active_date", "2000-01-01")),
+                "rr":           sigs.get("recruiter_response_rate", 0.0),
+                "rt_h":         sigs.get("avg_response_time_hours", 999),
+                "github":       gh_raw,
+                "relocate":     sigs.get("willing_to_relocate", False),
+                "work_mode":    sigs.get("preferred_work_mode", ""),
+                "int_rate":     sigs.get("interview_completion_rate", 0.5),
+                "saved_30d":    sigs.get("saved_by_recruiters_30d", 0),
+                "companies":    [h.get("company", "") for h in career[:4]],
+                "titles":       [h.get("title", "") for h in career[:4]],
+                "durations":    [h.get("duration_months", 0) for h in career[:4]],
+            }
+        })
 
-            retrieval_companies = [
-                career[ri].get("company", "")
-                for ri, s in enumerate(per_role_l1)
-                if norm(s) > RETRIEVAL_THRESHOLD and ri < len(career)
-            ]
+    with open(OUTPUT_PKL, "wb") as f:
+        pickle.dump(features, f, protocol=4)
 
-            features.append({
-                "candidate_id":          c["candidate_id"],
-                "career_signal":         career_signal,
-                "level1_raw":            float(score_l1),
-                "level1_norm":           n_l1,
-                "level2a_norm":          n_l2a,
-                "level2b_norm":          n_l2b,
-                "level2c_norm":          n_l2c,
-                "recency_boost":         recency_boost,
-                "depth_bonus":           depth_bonus,
-                "retrieval_role_count":  retrieval_role_count,
-                "retrieval_companies":   retrieval_companies,
-                "nth_bonus":             nth_bonus,
-                "nth_scores":            nth_scores,
-                "python_bonus":          compute_python_bonus(skills),
-                "product_score":         compute_product_score(career),
-                "yoe_score":             compute_yoe_score(yoe),
-                "location_score":        compute_location_score(profile, sigs),
-                "github_score":          gh_score,
-                "behavioral":            compute_behavioral(sigs),
-                "hopping_penalty":       compute_hopping_penalty(career),
-                "hp_penalty":            hp,
-                "meta": {
-                    "title":        profile.get("current_title", ""),
-                    "company":      profile.get("current_company", ""),
-                    "yoe":          yoe,
-                    "location":     profile.get("location", ""),
-                    "country":      profile.get("country", "").lower(),
-                    "notice":       sigs.get("notice_period_days", 90),
-                    "open_to_work": sigs.get("open_to_work_flag", False),
-                    "last_active":  days_since(sigs.get("last_active_date", "2000-01-01")),
-                    "rr":           sigs.get("recruiter_response_rate", 0.0),
-                    "rt_h":         sigs.get("avg_response_time_hours", 999),
-                    "github":       gh_raw,
-                    "relocate":     sigs.get("willing_to_relocate", False),
-                    "work_mode":    sigs.get("preferred_work_mode", ""),
-                    "int_rate":     sigs.get("interview_completion_rate", 0.5),
-                    "saved_30d":    sigs.get("saved_by_recruiters_30d", 0),
-                    "companies":    [h.get("company", "") for h in career[:4]],
-                    "titles":       [h.get("title", "") for h in career[:4]],
-                    "durations":    [h.get("duration_months", 0) for h in career[:4]],
-                }
-            })
-
-        print(f"Done. {len(features):,} passed gates. Gate breakdown: {gate_counts}")
-
-    with phase_timer("08_pickle_save"):
-        with open(OUTPUT_PKL, "wb") as f:
-            pickle.dump(features, f, protocol=4)
-        print(f"Saved -> {OUTPUT_PKL}")
-
-    TOTAL_TIME = time.perf_counter() - RUN_T0
-
-    print("\n" + "=" * 60)
-    print("TIMING SUMMARY")
-    print("=" * 60)
-    for name, dt in sorted(PHASE_TIMES.items(), key=lambda x: -x[1]):
-        print(f"  {name:<28} {dt:>8.2f}s  ({100*dt/TOTAL_TIME:5.1f}%)")
-    print(f"  {'TOTAL':<28} {TOTAL_TIME:>8.2f}s")
+    print(f"Done. Precompute finished — {len(features):,} candidates ready in {OUTPUT_PKL}")
 
 
 if __name__ == "__main__":
