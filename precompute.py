@@ -124,9 +124,9 @@ NTH_OPENSOURCE = [
 NTH_SETS = [
     ("finetuning",  NTH_FINETUNING,  0.04),
     ("l2r",         NTH_L2R,         0.05),
-    ("hrtech",      NTH_HRTECH,      0.05),
-    ("distributed", NTH_DISTRIBUTED, 0.03),
-    ("opensource",  NTH_OPENSOURCE,  0.03),
+    ("hrtech",      NTH_HRTECH,      0.02),
+    ("distributed", NTH_DISTRIBUTED, 0.04),
+    ("opensource",  NTH_OPENSOURCE,  0.07),
 ]
 
 CONSULTING = {
@@ -316,12 +316,12 @@ def compute_behavioral(sigs):
                 else 0.60 if rr >= 0.15 else 0.30)
     rt_s     = (1.0 if rt_h <= 24 else 0.90 if rt_h <= 72
                 else 0.75 if rt_h <= 168 else 0.50)
-    notice_s = (1.0 if notice <= 30 else 0.80 if notice <= 60
-                else 0.60 if notice <= 90 else 0.40)
+    notice_s = (1.0 if notice <= 30 else 0.70 if notice <= 60
+                else 0.50 if notice <= 90 else 0.30)
     int_s    = (1.0 if int_rate >= 0.8 else 0.85 if int_rate >= 0.6
                 else 0.70 if int_rate >= 0.4 else 0.50)
 
-    raw = open_s * 0.25 + act_s * 0.30 + rr_s * 0.20 + rt_s * 0.05 + notice_s * 0.12 + int_s * 0.08
+    raw = open_s * 0.25 + act_s * 0.27 + rr_s * 0.20 + rt_s * 0.05 + notice_s * 0.15 + int_s * 0.08
 
     completeness = sigs.get("profile_completeness_score", 0)
     if completeness >= 80: raw += 0.02
@@ -548,6 +548,16 @@ def main():
                 "companies":    [h.get("company", "") for h in career[:4]],
                 "titles":       [h.get("title", "") for h in career[:4]],
                 "durations":    [h.get("duration_months", 0) for h in career[:4]],
+                "skills_top": [s.get("name", "") for s in skills[:10]],
+                "retrieval_role_evidence": [
+                    {
+                        "company": career[ri].get("company", ""),
+                        "title":   career[ri].get("title", ""),
+                        "snippet": " ".join(career[ri].get("description", "").split()[:25])
+                    }
+                    for ri, s in enumerate(per_role_l1)
+                    if norm(s) > RETRIEVAL_THRESHOLD and ri < len(career)
+                ][:3],
             }
         })
 

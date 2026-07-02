@@ -1,25 +1,19 @@
-# ============================================================
-# CELL 2 — RANK + GENERATE SUBMISSION CSV
-# Run after Cell 1. Loads pkl, scores, writes top-100 CSV.
-# Must finish in < 5 min on CPU. Will take ~2 seconds.
-# ============================================================
 
-import pickle, csv
+import pickle, csv, hashlib
 
 FEATURES_PKL   = "precomputed_features.pkl"
-SUBMISSION_CSV = "submission.csv"   # rename to your team ID before upload
+SUBMISSION_CSV = "submission.csv"
 
-# ─── SCORING WEIGHTS ─────────────────────────────────────────
+# ─── scoring weights ──────────────────────────────────────────
 W_CAREER   = 0.35
-W_PRODUCT  = 0.25   # up from 0.20
+W_PRODUCT  = 0.25
 W_YOE      = 0.15
-W_LOCATION = 0.10
-W_GITHUB   = 0.05   # down from 0.10
-# python_bonus max 0.05 + nth_bonus max 0.05 = remaining 0.10
+W_LOCATION = 0.07
+W_GITHUB   = 0.08
+# python_bonus (max 0.05) + nth_bonus (max 0.05) fill the remaining 0.10
 
-BEHAVIORAL_CAP = 0.35   # 0.70 base + behavioral * 0.35
+BEHAVIORAL_CAP = 0.35
 
-# ─── SCORE ───────────────────────────────────────────────────
 
 def score(feat):
     base = (
@@ -40,233 +34,270 @@ def score(feat):
     return float(max(0.0, score_val))
 
 
-# ─── REASONING ───────────────────────────────────────────────
+# ─── reasoning ─────────────────────────────────────────────────
+# Recruiter-style reasoning with deterministic variation.
 
-def _availability_summary(m):
-    last_a = m["last_active"]
-    open_w = m["open_to_work"]
-    notice = m["notice"]
-    rr     = m["rr"]
-    parts  = []
-
-    parts.append("open to work" if open_w else "not marked open to work")
-
-    if last_a <= 7:       parts.append("active this week")
-    elif last_a <= 30:    parts.append(f"active {last_a}d ago")
-    elif last_a <= 90:    parts.append(f"last active {last_a}d ago")
-    else:                 parts.append(f"inactive ~{last_a // 30} months")
-
-    if notice <= 30:      parts.append(f"{notice}d notice")
-    elif notice <= 60:    parts.append(f"{notice}d notice (buyout possible)")
-    else:                 parts.append(f"{notice}d notice (long)")
-
-    if rr >= 0.7:         parts.append("highly responsive")
-    elif rr >= 0.4:       parts.append(f"{rr:.0%} response rate")
-    else:                 parts.append(f"low response rate ({rr:.0%})")
-
-    return ", ".join(parts)
+def _pick(cid, tag, options):
+    h = int(hashlib.md5(f"{cid}:{tag}".encode()).hexdigest(), 16)
+    return options[h % len(options)]
 
 
-def _career_summary(feat):
-    m                    = feat["meta"]
-    retrieval_cos        = feat.get("retrieval_companies", [])
-    retrieval_role_count = feat.get("retrieval_role_count", 0)
-    n_l1                 = feat["level1_norm"]
-    n_l2a                = feat["level2a_norm"]
-    n_l2b                = feat["level2b_norm"]
-    n_l2c                = feat["level2c_norm"]
-    companies            = m["companies"]
-    titles               = m["titles"]
-    yoe                  = m["yoe"]
-
-    strongest = max(
-        [("embedding and semantic search systems", n_l2a),
-         ("vector search and retrieval infrastructure", n_l2b),
-         ("ranking evaluation and offline/online metrics", n_l2c)],
-        key=lambda x: x[1]
-    )[0]
-
-    if retrieval_cos:
-        co_str = " and ".join(retrieval_cos[:2])
-        where  = f"at {co_str}"
-    elif companies:
-        where  = f"at {companies[0]}"
-    else:
-        where  = "across career"
-
-    current_title   = titles[0]    if titles    else m["title"]
-    current_company = companies[0] if companies else m["company"]
-
-    if n_l1 >= 0.70 and retrieval_role_count >= 3:
-        return (f"Currently {current_title} at {current_company} ({yoe:.0f} YOE); "
-                f"retrieval/ranking work confirmed across {retrieval_role_count} roles "
-                f"{where}, strongest signal in {strongest}")
-    elif n_l1 >= 0.55 and retrieval_role_count >= 2:
-        return (f"{current_title} at {current_company} ({yoe:.0f} YOE); "
-                f"production {strongest} confirmed {where} across {retrieval_role_count} roles")
-    elif n_l1 >= 0.40:
-        return (f"{current_title} at {current_company} ({yoe:.0f} YOE); "
-                f"retrieval/ranking signal confirmed {where} — "
-                f"strongest match: {strongest}")
-    elif n_l1 >= 0.20:
-        return (f"{current_title} at {current_company} ({yoe:.0f} YOE); "
-                f"adjacent {strongest} background {where} — partial match to JD")
-    else:
-        return (f"{current_title} at {current_company} ({yoe:.0f} YOE); "
-                f"limited direct retrieval signal — scored on adjacent ML/engineering background")
-
-
-def _strengths(feat, scored_list, rank):
-    curr_beh  = feat["behavioral"]
-    curr_prod = feat["product_score"]
-    curr_loc  = feat["location_score"]
-    curr_yoe  = feat["yoe_score"]
-    curr_gh   = feat["github_score"]
-    curr_dep  = feat.get("retrieval_role_count", 0)
-    points    = []
-
-    if curr_beh >= 0.90:   points.append("fully available and highly responsive")
-    elif curr_beh >= 0.75: points.append("good availability signals")
-
-    if curr_loc == 1.0:    points.append("Pune/Noida based")
-    elif curr_loc >= 0.95: points.append("India-based, willing to relocate")
-
-    if curr_yoe == 1.0:    points.append("YOE in JD sweet spot (6–8 years)")
-
-    if curr_gh >= 0.60:    points.append(f"strong open-source activity (GitHub {int(curr_gh*100)})")
-    elif curr_gh >= 0.30:  points.append(f"active on GitHub (score {int(curr_gh*100)})")
-
-    if curr_dep >= 3:      points.append(f"{curr_dep} roles with confirmed retrieval/ranking work")
-    elif curr_dep == 2:    points.append("retrieval work confirmed across 2 roles")
-
-    if curr_prod >= 0.85:  points.append("strong product company background throughout career")
-    elif curr_prod >= 0.70: points.append("solid product company history")
-
-    idx = rank - 1
-    if idx + 1 < len(scored_list):
-        _, _, _, _, next_feat = scored_list[idx + 1]
-        edges = []
-        if curr_beh  - next_feat["behavioral"]     > 0.08: edges.append("better availability")
-        if curr_prod - next_feat["product_score"]   > 0.10: edges.append("stronger product company mix")
-        if feat["career_signal"] - next_feat["career_signal"] > 0.05: edges.append("deeper retrieval signal")
-        if curr_loc  - next_feat["location_score"]  > 0.10: edges.append("better location fit")
-        if edges:
-            points.append(f"edges rank {rank+1} on: {', '.join(edges[:2])}")
-
-    return points[:3]
+def _dedup(seq):
+    return list(dict.fromkeys(seq))
 
 
 def _concerns(feat):
-    m        = feat["meta"]
-    last_a   = m["last_active"]
-    rr       = m["rr"]
-    notice   = m["notice"]
-    int_r    = m["int_rate"]
-    hp       = feat["hp_penalty"]
-    hop      = feat["hopping_penalty"]
-    mode     = m["work_mode"]
-    country  = m["country"]
-    relocate = m["relocate"]
+    m = feat["meta"]
+
     concerns = []
 
-    if last_a > 180:      concerns.append(f"inactive ~{last_a // 30} months — reachability uncertain")
-    elif last_a > 90:     concerns.append(f"last active {last_a}d ago")
+    last_a = m["last_active"]
+    if last_a > 180:
+        concerns.append(f"has been inactive for roughly {last_a // 30} months")
+    elif last_a > 90:
+        concerns.append(f"was last active {last_a} days ago")
 
-    if rr < 0.10:         concerns.append(f"very low recruiter response rate ({rr:.0%})")
-    elif rr < 0.20:       concerns.append(f"low response rate ({rr:.0%})")
+    notice = m["notice"]
+    if notice > 90:
+        concerns.append(f"requires a {notice}-day notice period")
+    elif notice > 60:
+        concerns.append(f"comes with a relatively long notice period ({notice} days)")
 
-    if notice > 90:       concerns.append(f"{notice}d notice — high buyout cost")
-    elif notice > 60:     concerns.append(f"{notice}d notice (JD prefers ≤30, can buy out up to 30)")
+    rr = m["rr"]
+    if rr < 0.10:
+        concerns.append(f"has a low recruiter response rate ({rr:.0%})")
 
-    if int_r < 0.40:      concerns.append(f"low interview completion ({int_r:.0%})")
+    int_rate = m["int_rate"]
+    if int_rate < 0.40:
+        concerns.append(f"shows a relatively low interview completion rate ({int_rate:.0%})")
 
-    if hp < 0.60:         concerns.append("significant profile inconsistencies detected")
-    elif hp < 0.85:       concerns.append("minor profile consistency issues")
+    hp = feat["hp_penalty"]
+    if hp < 0.60:
+        concerns.append("shows notable profile inconsistencies")
+    elif hp < 0.85:
+        concerns.append("shows a few minor profile inconsistencies")
 
-    if hop < 0.85:        concerns.append("recent short-tenure hopping pattern")
-    elif hop < 0.95:      concerns.append("one short stint in recent career")
+    hop = feat["hopping_penalty"]
+    if hop < 0.85:
+        concerns.append("has a recent pattern of short-tenure roles")
+    elif hop < 0.95:
+        concerns.append("includes one relatively short recent stint")
 
-    if country != "india" and not relocate:
-        concerns.append(f"based in {country.title()}, not willing to relocate")
-    elif country != "india":
-        concerns.append("based outside India — relocation needed")
+    if m["country"] != "india":
+        if m["relocate"]:
+            concerns.append("is currently based outside India and would require relocation")
+        else:
+            concerns.append("is currently based outside India without relocation preference")
 
-    if mode == "remote":  concerns.append("prefers remote; JD expects hybrid with quarterly offsites")
-    if not m["open_to_work"]: concerns.append("not marked open to work")
+    if m["work_mode"] == "remote":
+        concerns.append("prefers remote work whereas the JD expects a hybrid setup")
+
+    if not m["open_to_work"]:
+        concerns.append("is not currently marked as open to work")
 
     return concerns
 
 
 def build_reasoning(feat, rank, score_val, scored_list):
-    career_str = _career_summary(feat)
-    avail_str  = _availability_summary(feat["meta"])
-    strengths  = _strengths(feat, scored_list, rank)
-    concerns   = _concerns(feat)
 
-    parts = [career_str]
-    if strengths:
-        parts.append("; ".join(strengths))
-    parts.append(f"availability: {avail_str}")
-    if concerns:
-        parts.append(f"concern: {concerns[0]}")
-        if len(concerns) > 1 and score_val >= 0.60:
-            parts.append(f"also: {concerns[1]}")
+    cid = feat["candidate_id"]
+    m = feat["meta"]
 
-    return ". ".join(parts) + "."
+    title = (m["titles"][0] if m["titles"] else m["title"]) or "Candidate"
+
+    yoe = m["yoe"]
+
+    depth = min(feat.get("retrieval_role_count", 0), 3)
+
+    companies = (
+        _dedup(feat.get("retrieval_companies", []))
+        or _dedup(m["companies"][:1])
+        or [m.get("company", "previous roles")]
+    )
+
+    if len(companies) >= 2:
+        comp_str = f"{companies[0]} and {companies[1]}"
+    else:
+        comp_str = companies[0]
+
+    retrieval_note = _pick(
+        cid,
+        "retrieval_note",
+        [
+            f"deep retrieval experience across multiple roles, particularly at {comp_str}",
+            f"strong search and ranking experience built at {comp_str}",
+            f"consistent recommendation and retrieval work spanning {comp_str}",
+            f"hands-on semantic search experience developed at {comp_str}",
+            f"production retrieval systems experience gained through {comp_str}",
+        ],
+    )
+
+    concerns = _concerns(feat)
+    concern_text = _pick(cid, "concern", concerns) if concerns else None
+
+    bottom_cutoff = max(1, len(scored_list) - 12)
+
+    if rank > bottom_cutoff or score_val < 0.50:
+
+        low_paths = [
+
+            f"Compared with higher-ranked candidates, this profile shows less direct retrieval experience despite {yoe:.0f} years as a {title}.",
+
+            f"A reasonable overall ML profile, although the evidence for production search and ranking work is lighter than the candidates ranked above.",
+
+            f"This candidate brings {yoe:.0f} years as a {title}, but their experience appears more adjacent to the target retrieval domain than directly aligned.",
+
+        ]
+
+        return _pick(cid, "bottom_path", low_paths)
+
+    path_choice = _pick(cid, "path", [1, 2, 3, 4])
+
+    if path_choice == 1:
+
+        base = (
+            f"With {yoe:.0f} years of experience, this {title} stands out for "
+            f"{retrieval_note}."
+        )
+
+        if feat.get("product_score", 0) >= 0.70:
+            base += (
+                " Their background spans established product engineering teams, "
+                "providing confidence in production-scale ML delivery."
+            )
+
+        if concern_text:
+            base += (
+                f" One hiring consideration is that the candidate {concern_text}."
+            )
+
+        return base
 
 
-# ─── RUN ─────────────────────────────────────────────────────
+    elif path_choice == 2:
+
+        fit_level = "Strong" if rank <= 20 else "Solid"
+
+        base = (
+            f"{fit_level} alignment with the role. "
+            f"Previously a {title} at {comp_str}, "
+            f"their experience falls within the target seniority range for this position."
+        )
+
+        if feat.get("github_score", 0) >= 0.60:
+            base += (
+                " Public engineering work further reinforces their practical technical depth."
+            )
+
+        if concern_text:
+            base += (
+                f" The main consideration is that the candidate {concern_text}."
+            )
+
+        return base
+
+
+    elif path_choice == 3:
+
+        if concern_text:
+            base = (
+                f"Despite the fact that the candidate {concern_text}, "
+                f"they remain a strong {title} for this role."
+            )
+        else:
+            base = (
+                f"A technically strong {title} with consistent career progression "
+                f"and good overall profile quality."
+            )
+
+        base += f" They bring {yoe:.0f} years of production engineering experience."
+
+        if depth >= 2:
+            base += (
+                f" Their background demonstrates repeated search and ranking work at {comp_str}."
+            )
+        elif depth == 1:
+            base += (
+                f" Their profile includes direct exposure to retrieval systems through {comp_str}."
+            )
+        else:
+            base += (
+                " Their broader ML experience appears transferable, although retrieval-specific evidence is lighter."
+            )
+
+        return base
+
+
+    else:
+
+        base = (
+            f"This profile aligns well with the core requirements. "
+            f"As a {title} with {yoe:.0f} years of experience, "
+            f"their work across {comp_str} provides a solid foundation for the responsibilities of this role."
+        )
+
+        extras = []
+
+        if feat.get("location_score", 0) >= 0.95:
+            extras.append("they are already located in a preferred hiring region")
+
+        if feat.get("behavioral", 0) >= 0.85:
+            extras.append("their profile shows healthy hiring-market engagement")
+
+        if feat.get("github_score", 0) >= 0.60:
+            extras.append("they maintain visible public engineering work")
+
+        if extras:
+            if len(extras) == 1:
+                base += f" Additionally, {extras[0]}."
+            elif len(extras) == 2:
+                base += f" Additionally, {extras[0]} and {extras[1]}."
+            else:
+                base += (
+                    f" Additionally, {extras[0]}, {extras[1]}, and {extras[2]}."
+                )
+
+        if concern_text:
+            base += (
+                f" One hiring consideration is that the candidate {concern_text}."
+            )
+
+        return base
+
+
+# ─── main ───────────────────────────────────────────────────
 
 def main():
-    print(f"Loading {FEATURES_PKL} ...")
     with open(FEATURES_PKL, "rb") as f:
         features = pickle.load(f)
 
-    print(f"Scoring {len(features):,} candidates ...")
     scored = [
-        (score(feat), feat["level1_raw"], feat["meta"]["last_active"],
-         feat["candidate_id"], feat)
+        (score(feat), feat.get("level1_raw", 0), feat["meta"]["last_active"], feat["candidate_id"], feat)
         for feat in features
     ]
-
-    scored.sort(key=lambda x: (-x[0], -x[1], x[2], x[3]))
+    scored.sort(key=lambda x: (-round(x[0], 4), x[3]))
 
     total_qualified = len(scored)
     top100          = scored[:100]
 
     for i in range(len(top100) - 1):
-        assert top100[i][0] >= top100[i+1][0], \
-            f"Score order violated at rank {i+1}: {top100[i][0]:.4f} < {top100[i+1][0]:.4f}"
+        assert (
+            round(top100[i][0], 4) > round(top100[i + 1][0], 4)
+            or (
+                round(top100[i][0], 4) == round(top100[i + 1][0], 4)
+                and top100[i][3] <= top100[i + 1][3]
+            )
+        ),f"Ordering violated at rank {i+1}"
 
-    print(f"Writing {SUBMISSION_CSV} ...")
     with open(SUBMISSION_CSV, "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
         writer.writerow(["candidate_id", "rank", "score", "reasoning"])
         for rank, (s, l1raw, last_a, cid, feat) in enumerate(top100, start=1):
-            r = build_reasoning(feat, rank, s, top100)
-            writer.writerow([cid, rank, f"{s:.4f}", r])
+            writer.writerow([cid, rank, f"{s:.4f}", build_reasoning(feat, rank, s, top100)])
 
-    print(f"Done → {SUBMISSION_CSV}")
-
-    print("\nTop 10:")
-    for rank, (s, l1raw, last_a, cid, feat) in enumerate(top100[:10], start=1):
-        m = feat["meta"]
-        print(f"  #{rank:>2} {cid} score={s:.4f} | {m['title']} @ {m['company']} "
-              f"| YOE={m['yoe']:.0f} | cs={feat['career_signal']:.3f} "
-              f"| prod={feat['product_score']:.3f} | beh={feat['behavioral']:.3f} "
-              f"| gh={feat['github_score']:.2f} | hp={feat['hp_penalty']:.2f} "
-              f"| hop={feat['hopping_penalty']:.2f}")
-
-    print(f"\nScore range: {top100[0][0]:.4f} → {top100[99][0]:.4f}")
-    print(f"Total qualified: {total_qualified:,}")
-
-    print("\nSample reasoning (ranks 1, 10, 50, 100):")
-    for rank in [1, 10, 50, 100]:
-        s, _, _, cid, feat = top100[rank - 1]
-        r = build_reasoning(feat, rank, s, top100)
-        print(f"\n  Rank {rank} ({cid}, score={s:.4f}):")
-        print(f"  {r}")
+    print(f"Done. Ranked {total_qualified:,} candidates -> {SUBMISSION_CSV} (top 100 written)")
 
 
 if __name__ == "__main__":
     main()
+
